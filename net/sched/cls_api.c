@@ -29,6 +29,7 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 #include <net/pkt_cls.h>
+#include <net/tc_act/tc_gact.h>
 
 /* The list of all installed classifier types */
 static LIST_HEAD(tcf_proto_base);
@@ -648,6 +649,10 @@ static int tfilter_notify(struct net *net, struct sk_buff *oskb,
 	struct sk_buff *skb;
 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
 
+	/* If the request originated from kernel */
+	if (n->nlmsg_pid == 0)
+		return 0;
+
 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
 	if (!skb)
 		return -ENOBUFS;
@@ -670,9 +675,13 @@ static int tfilter_del_notify(struct net *net, struct sk_buff *oskb,
 			      struct Qdisc *q, u32 parent,
 			      void *fh, bool unicast, bool *last)
 {
-	struct sk_buff *skb;
+	struct sk_buff *skb = NULL;
 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
 	int err;
+
+	/* If the request originated from kernel */
+	if (n->nlmsg_pid == 0)
+		goto skip_fill_node;
 
 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
 	if (!skb)
@@ -684,11 +693,14 @@ static int tfilter_del_notify(struct net *net, struct sk_buff *oskb,
 		return -EINVAL;
 	}
 
+skip_fill_node:
 	err = tp->ops->delete(tp, fh, last);
 	if (err) {
 		kfree_skb(skb);
 		return err;
 	}
+	if (n->nlmsg_pid == 0)
+		return 0;
 
 	if (unicast)
 		return netlink_unicast(net->rtnl, skb, portid, MSG_DONTWAIT);
@@ -734,7 +746,7 @@ static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
 	int err;
 	int tp_created;
 
-	if ((n->nlmsg_type != RTM_GETTFILTER) &&
+	if ((n->nlmsg_type != RTM_GETTFILTER) && (n->nlmsg_pid !=0) &&
 	    !netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN))
 		return -EPERM;
 
@@ -979,17 +991,18 @@ struct req_struct {
 int tc_filter_ingress_add(struct net_device *dev, struct tcmsg *t, int keys,
 			  struct tc_keys *tc_keys[keys])
 {
-	int err = 0, i = 0;
-
 	__be16 eth_type;
+	char act_kind[10];
+	int err = 0, i = 0;
+	u32 flags;
 
 	struct sock *sk = NULL;
 	struct sk_buff *skb = NULL;
 	struct tc_keys *key = NULL;
 	struct rtattr *tail, *tail1, *tail2, *tail3;
 
-	if (!t)
-		return -ENOENT;
+	if (!t || !keys || !tc_keys)
+		return -ENODATA;
 
 	struct req_struct req = {
 		.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg)),
@@ -1002,48 +1015,115 @@ int tc_filter_ingress_add(struct net_device *dev, struct tcmsg *t, int keys,
 		.t.tcm_ifindex = dev->ifindex,
 	};
 
-	eth_type = TC_H_MIN(req.t.tcm_info);
-
+	/* pre classifier start */
 	for (;i < keys && tc_keys[i] != NULL; i++)
 	{
 		key = tc_keys[i];
 		switch(key->type)
 		{
 		case TCA_KIND:
-		case TCA_ACT_KIND:
-			tail2 = NLMSG_TAIL(&req.n);
-			addattr_l(&req.n, MAX_MSG, TCA_FLOWER_ACT, NULL, 0);
-			tail1 = NLMSG_TAIL(&req.n);
-			addattr_l(&req.n, MAX_MSG, 1, NULL, 0);
-			addattr(&req.n, key, &key->data.act_kind);
-			break;
-			addattr(&req.n, key, &key->data.classifier_kind);
-			tail3 = (struct rtattr *)
-				(((void *) &req.n) + NLMSG_ALIGN((&req.n)->nlmsg_len));
-			addattr_l(&req.n, MAX_MSG, TCA_OPTIONS, NULL, 0);
-			break;
+			if (key->data.classifier_kind) {
+				addattr(&req.n, key, &key->data.classifier_kind);
+				tail3 = (struct rtattr *)
+					(((void *) &req.n) + NLMSG_ALIGN((&req.n)->nlmsg_len));
+				addattr_l(&req.n, MAX_MSG, TCA_OPTIONS, NULL, 0);
+				tc_keys[i] = NULL;
+				goto start_filter_processing;
+			}
+		}
+	}
+	/* pre classifier end */
+
+start_filter_processing:
+	/* classifier start */
+	for (;i < keys && tc_keys[i] != NULL; i++)
+	{
+		key = tc_keys[i];
+		switch(key->type)
+		{
 		case TCA_FLOWER_KEY_IP_PROTO:
 			addattr(&req.n, key, &key->data.ip_proto);
+			tc_keys[i] = NULL;
 			break;
 		case TCA_FLOWER_KEY_IPV4_DST:
 		case TCA_FLOWER_KEY_IPV4_SRC:
 			addattr(&req.n, key, &key->data.ip);
+			tc_keys[i] = NULL;
 			break;
 		case TCA_FLOWER_KEY_IPV4_SRC_MASK:
 		case TCA_FLOWER_KEY_IPV4_DST_MASK:
 			addattr(&req.n, key, &key->data.ip_mask);
+			tc_keys[i] = NULL;
 			break;
 		case TCA_FLOWER_KEY_TCP_SRC:
 		case TCA_FLOWER_KEY_TCP_DST:
 		case TCA_FLOWER_KEY_UDP_SRC:
 		case TCA_FLOWER_KEY_UDP_DST:
 			addattr(&req.n, key, &key->data.port);
+			tc_keys[i] = NULL;
 			break;
-		default:
-			return -EOPNOTSUPP;
-
+		case TCA_FLOWER_KEY_ETH_TYPE:
+			eth_type = TC_H_MIN(req.t.tcm_info);
+			break;
+		case TCA_FLOWER_FLAGS:
+			flags = key->data.flags;
+			tc_keys[i] = NULL;
+			break;
 		}
 	}
+	/* classifier start */
+
+	/* pre action start */
+	for (;i < keys && tc_keys[i] != NULL; i++)
+	{
+		key = tc_keys[i];
+		switch(key->type)
+		{
+		case TCA_ACT_KIND:
+			if (key->data.act_kind) {
+				tail2 = NLMSG_TAIL(&req.n);
+				addattr_l(&req.n, MAX_MSG, TCA_FLOWER_ACT, NULL, 0);
+				tail1 = NLMSG_TAIL(&req.n);
+				addattr_l(&req.n, MAX_MSG, 1, NULL, 0);
+				addattr(&req.n, key, &key->data.act_kind);
+				strncpy(act_kind, key->data.act_kind, sizeof(act_kind));
+				tc_keys[i] = NULL;
+				goto start_action_processing;
+			}
+		}
+	}
+	/* pre action end */
+
+start_action_processing:
+	/* action start */
+	for (;i < keys && tc_keys[i] != NULL; i++)
+	{
+		key = tc_keys[i];
+
+		if (!strncmp(act_kind, "gact", sizeof(act_kind))) {
+		    switch(key->type)
+		    {
+		    case TCA_GACT_PARMS:
+		    tail = NLMSG_TAIL(&req.n);
+		    addattr_l(&req.n, MAX_MSG, TCA_ACT_OPTIONS, NULL, 0);
+		    addattr(&req.n, key, &key->data.action);
+		    tail->rta_len = (void *) NLMSG_TAIL(&req.n) - (void *) tail;
+		    tail1->rta_len = (void *) NLMSG_TAIL(&req.n) - (void *) tail1;
+		    tail2->rta_len = (void *) NLMSG_TAIL(&req.n) - (void *) tail2;
+		    tc_keys[i] = NULL;
+		    goto end;
+		    }
+		}
+	}
+	/* action end */
+
+end:
+	/* post classifier start */
+	addattr_l(&req.n, MAX_MSG, TCA_FLOWER_FLAGS, &flags, sizeof(u32));
+	addattr_l(&req.n, MAX_MSG, TCA_FLOWER_KEY_ETH_TYPE, &eth_type, sizeof(u16));
+	tail3->rta_len = (((void *)
+			   (&req.n))+(&req.n)->nlmsg_len) - (void *)tail3;
+	/* post classifier end */
 
 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
 	if (!skb)

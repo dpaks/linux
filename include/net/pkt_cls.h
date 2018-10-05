@@ -42,7 +42,6 @@ struct tc_keys {
 		char mac[ETH_ALEN];
 		u32 flags;
 		u16 port;
-		u16 eth_type;
 		u32 ip;
 		u32 ip_mask;
 		u8 ip_proto;
