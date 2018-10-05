@@ -938,6 +938,125 @@ errout:
 	return err;
 }
 
+#define MAX_MSG 1024
+
+#define NLMSG_TAIL(nmsg) \
+	((struct rtattr *) (((void *) (nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+
+static int addattr_l(struct nlmsghdr *n, int maxlen, int type, const void *data,
+		     int alen)
+{
+	int len = RTA_LENGTH(alen);
+	struct rtattr *rta = NULL;
+
+	if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > maxlen) {
+		printk("addattr_l ERROR: message exceeded bound of %d",
+		     maxlen);
+		return -1;
+	}
+	rta = NLMSG_TAIL(n);
+	rta->rta_type = type;
+	rta->rta_len = len;
+	if (alen)
+		memcpy(RTA_DATA(rta), data, alen);
+	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len);
+
+	return 0;
+}
+
+static int addattr(struct nlmsghdr *n, struct tc_keys *key,
+		   const void *data)
+{
+	return addattr_l(n, MAX_MSG, key->type, &data, key->len);
+}
+
+struct req_struct {
+	struct nlmsghdr n;
+	struct tcmsg            t;
+	char                    buf[MAX_MSG];
+};
+
+int tc_filter_ingress_add(struct net_device *dev, struct tcmsg *t, int keys,
+			  struct tc_keys *tc_keys[keys])
+{
+	int err = 0, i = 0;
+
+	__be16 eth_type;
+
+	struct sock *sk = NULL;
+	struct sk_buff *skb = NULL;
+	struct tc_keys *key = NULL;
+	struct rtattr *tail, *tail1, *tail2, *tail3;
+
+	if (!t)
+		return -ENOENT;
+
+	struct req_struct req = {
+		.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg)),
+		.n.nlmsg_flags = NLM_F_REQUEST|NLM_F_EXCL|NLM_F_CREATE,
+		.n.nlmsg_type = RTM_NEWTFILTER,
+		.n.nlmsg_pid = 0,
+		.n.nlmsg_seq = 0,
+		.t.tcm_family = AF_UNSPEC,
+		.t.tcm_parent = TC_H_INGRESS,
+		.t.tcm_ifindex = dev->ifindex,
+	};
+
+	eth_type = TC_H_MIN(req.t.tcm_info);
+
+	for (;i < keys && tc_keys[i] != NULL; i++)
+	{
+		key = tc_keys[i];
+		switch(key->type)
+		{
+		case TCA_KIND:
+		case TCA_ACT_KIND:
+			tail2 = NLMSG_TAIL(&req.n);
+			addattr_l(&req.n, MAX_MSG, TCA_FLOWER_ACT, NULL, 0);
+			tail1 = NLMSG_TAIL(&req.n);
+			addattr_l(&req.n, MAX_MSG, 1, NULL, 0);
+			addattr(&req.n, key, &key->data.act_kind);
+			break;
+			addattr(&req.n, key, &key->data.classifier_kind);
+			tail3 = (struct rtattr *)
+				(((void *) &req.n) + NLMSG_ALIGN((&req.n)->nlmsg_len));
+			addattr_l(&req.n, MAX_MSG, TCA_OPTIONS, NULL, 0);
+			break;
+		case TCA_FLOWER_KEY_IP_PROTO:
+			addattr(&req.n, key, &key->data.ip_proto);
+			break;
+		case TCA_FLOWER_KEY_IPV4_DST:
+		case TCA_FLOWER_KEY_IPV4_SRC:
+			addattr(&req.n, key, &key->data.ip);
+			break;
+		case TCA_FLOWER_KEY_IPV4_SRC_MASK:
+		case TCA_FLOWER_KEY_IPV4_DST_MASK:
+			addattr(&req.n, key, &key->data.ip_mask);
+			break;
+		case TCA_FLOWER_KEY_TCP_SRC:
+		case TCA_FLOWER_KEY_TCP_DST:
+		case TCA_FLOWER_KEY_UDP_SRC:
+		case TCA_FLOWER_KEY_UDP_DST:
+			addattr(&req.n, key, &key->data.port);
+			break;
+		default:
+			return -EOPNOTSUPP;
+
+		}
+	}
+
+	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
+	if (!skb)
+		return -ENOBUFS;
+	sock_net_set(sk, &init_net);
+	skb->sk = sk;
+
+	err = tc_ctl_tfilter(skb, &req.n, NULL);
+
+	return err;
+}
+EXPORT_SYMBOL(tc_filter_ingress_add);
+
 struct tcf_dump_args {
 	struct tcf_walker w;
 	struct sk_buff *skb;
