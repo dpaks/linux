@@ -34,6 +34,32 @@ struct tcf_block_ext_info {
 struct tcf_block_cb;
 bool tcf_queue_work(struct work_struct *work);
 
+struct tc_keys {
+	u16 type;
+	u16 len;
+	union {
+			/* match part start */
+		char mac[ETH_ALEN];
+		u32 flags;
+		u16 port;
+		u32 ip;
+		u32 ip_mask;
+		u8 ip_proto;
+		char classifier_kind[10];
+		/* match part end */
+		/* actions part start */
+		char act_kind[10];
+		void *action;
+		//struct tc_gact p;
+		//struct tc_mirred p;
+		/* actions part end */
+	} data;
+};
+
+int tc_filter_ingress_add(struct net_device *dev,
+			  struct tcmsg *t, int keys,
+			  struct tc_keys *tc_keys[]);
+
 #ifdef CONFIG_NET_CLS
 struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
 				bool create);
